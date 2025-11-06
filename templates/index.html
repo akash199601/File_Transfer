@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Python FileShare</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body{font-family:sans-serif;padding:20px}
+    #progress{margin-top:10px}
+  </style>
+</head>
+<body>
+  <h2>Python P2P FileShare</h2>
+  <button id="create">Create Room (Mobile)</button>
+  <input id="room" placeholder="Enter room ID">
+  <button id="join">Join Room (Laptop)</button>
+
+  <p id="info"></p>
+  <input type="file" id="fileInput" multiple style="display:none">
+  <div id="progress"></div>
+
+<script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+<script>
+const socket = io();
+let pc, dc, room;
+
+document.getElementById('create').onclick = () => {
+  socket.emit('create-room');
+};
+
+socket.on('room-created', (data) => {
+  room = data.room_id;
+  document.getElementById('info').textContent = 
+    'Share this Room ID: ' + room;
+  init(true);
+});
+
+document.getElementById('join').onclick = () => {
+  room = document.getElementById('room').value;
+  socket.emit('join-room', { room });
+  init(false);
+};
+
+socket.on('peer-joined', () => {
+  console.log('peer joined, sending offer');
+  makeOffer();
+});
+
+socket.on('signal', async (data) => {
+  if (data.type === 'offer') {
+    await pc.setRemoteDescription(data.sdp);
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    socket.emit('signal', { room, type: 'answer', sdp: answer });
+  } else if (data.type === 'answer') {
+    await pc.setRemoteDescription(data.sdp);
+  } else if (data.type === 'candidate') {
+    try { await pc.addIceCandidate(data.candidate); } catch(e){console.log(e);}
+  }
+});
+
+function init(isCaller){
+  const config = { iceServers:[{urls:'stun:stun.l.google.com:19302'}] };
+  pc = new RTCPeerConnection(config);
+  pc.onicecandidate = e => {
+    if (e.candidate) socket.emit('signal', { room, type:'candidate', candidate:e.candidate });
+  };
+  pc.ondatachannel = e => {
+    dc = e.channel;
+    setupDC();
+  };
+  if(isCaller){
+    dc = pc.createDataChannel('file');
+    setupDC();
+  }
+}
+
+function setupDC(){
+  dc.binaryType = 'arraybuffer';
+  dc.onopen = () => {
+    document.getElementById('fileInput').style.display = 'block';
+  };
+  dc.onmessage = handleIncoming;
+}
+
+function makeOffer(){
+  pc.createOffer().then(o=>{
+    pc.setLocalDescription(o);
+    socket.emit('signal', { room, type:'offer', sdp:o });
+  });
+}
+
+const inc = { buffers:[], name:'', size:0, received:0 };
+function handleIncoming(e){
+  if (typeof e.data === 'string'){
+    const meta = JSON.parse(e.data);
+    inc.name = meta.name; inc.size = meta.size; inc.buffers=[];
+    document.getElementById('progress').textContent = `Receiving: ${meta.name}`;
+    return;
+  }
+  inc.buffers.push(e.data);
+  inc.received += e.data.byteLength;
+  if (inc.received === inc.size){
+    const blob = new Blob(inc.buffers);
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = inc.name;
+    a.textContent = 'Download ' + inc.name;
+    document.body.appendChild(a);
+  }
+}
+
+document.getElementById('fileInput').onchange = async (e) => {
+  for (const f of e.target.files){
+    dc.send(JSON.stringify({ name: f.name, size: f.size }));
+    const buf = await f.arrayBuffer();
+    const chunkSize = 64 * 1024;
+    for (let i=0; i<buf.byteLength; i+=chunkSize){
+      dc.send(buf.slice(i, i+chunkSize));
+    }
+    document.getElementById('progress').textContent = `Sent: ${f.name}`;
+  }
+};
+</script>
+</body>
+</html>
