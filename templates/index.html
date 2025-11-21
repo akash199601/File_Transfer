@@ -1,208 +1,126 @@
-<!doctype html>
+<!DOCTYPE html>
 <html>
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>File Transfer (P2P) - Python</title>
+  <meta charset="utf-8">
+  <title>Python FileShare</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
-    body{font-family:system-ui,Segoe UI,Roboto;max-width:900px;margin:24px auto;padding:12px}
-    .row{display:flex;gap:8px;align-items:center;margin:8px 0}
-    input, button {padding:8px;border:1px solid #ccc;border-radius:6px}
-    #qr {width:160px;height:160px}
-    #messages {margin-top:12px}
-    #files {margin-top:12px}
-    a.download {display:block;margin-top:6px}
+    body{font-family:sans-serif;padding:20px}
+    #progress{margin-top:10px}
   </style>
 </head>
 <body>
   <h2>Python P2P FileShare</h2>
+  <button id="create">Create Room (Mobile)</button>
+  <input id="room" placeholder="Enter room ID">
+  <button id="join">Join Room (Laptop)</button>
 
-  <div class="row">
-    <button id="createBtn">Create Room (Mobile)</button>
-    <input id="roomInput" placeholder="Enter room ID or paste URL" style="flex:1"/>
-    <button id="joinBtn">Join Room (Laptop)</button>
-  </div>
-
-  <div id="createdArea" style="display:none; margin-top:12px;">
-    <p>Share this Room link or scan QR from laptop:</p>
-    <input id="roomUrl" readonly style="width:100%"/>
-    <div id="qr"></div>
-  </div>
-
-  <div id="transfer" style="display:none;">
-    <p><strong>Connected.</strong> Choose file(s) to send:</p>
-    <input type="file" id="fileInput" multiple />
-    <div id="progress"></div>
-    <div id="messages"></div>
-    <div id="files"></div>
-  </div>
+  <p id="info"></p>
+  <input type="file" id="fileInput" multiple style="display:none">
+  <div id="progress"></div>
 
 <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
-
 <script>
 const socket = io();
-let pc, dc;
-let roomId = '';
-const STUN_CONFIG = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+let pc, dc, room;
 
-document.getElementById('createBtn').onclick = () => {
+document.getElementById('create').onclick = () => {
   socket.emit('create-room');
 };
 
 socket.on('room-created', (data) => {
-  roomId = data.room;
-  const url = location.origin + '/?room=' + roomId;
-  document.getElementById('roomUrl').value = url;
-  document.getElementById('createdArea').style.display = 'block';
-  // show QR
-  document.getElementById('qr').innerHTML = '';
-  new QRCode(document.getElementById('qr'), { text: url, width:160, height:160 });
-  initPeer(true);
+  room = data.room_id;
+  document.getElementById('info').textContent = 
+    'Share this Room ID: ' + room;
+  init(true);
 });
 
-document.getElementById('joinBtn').onclick = () => {
-  const v = document.getElementById('roomInput').value.trim();
-  if (!v) { alert('Enter room id or URL'); return; }
-  // if full URL provided, extract `room` param
-  try {
-    const u = new URL(v);
-    const r = u.searchParams.get('room');
-    if (r) roomId = r;
-    else roomId = v;
-  } catch (e) {
-    roomId = v;
-  }
-  socket.emit('join-room', { room: roomId });
-  initPeer(false);
+document.getElementById('join').onclick = () => {
+  room = document.getElementById('room').value;
+  socket.emit('join-room', { room });
+  init(false);
 };
 
 socket.on('peer-joined', () => {
-  // When a peer joins the room (for the caller), create offer
-  if (pc && dc && pc.signalingState === 'stable') {
-    createAndSendOffer();
-  }
+  console.log('peer joined, sending offer');
+  makeOffer();
 });
 
 socket.on('signal', async (data) => {
-  if (!pc) return;
   if (data.type === 'offer') {
     await pc.setRemoteDescription(data.sdp);
-    const a = await pc.createAnswer();
-    await pc.setLocalDescription(a);
-    socket.emit('signal', { room: roomId, type: 'answer', sdp: pc.localDescription });
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    socket.emit('signal', { room, type: 'answer', sdp: answer });
   } else if (data.type === 'answer') {
     await pc.setRemoteDescription(data.sdp);
   } else if (data.type === 'candidate') {
-    try { await pc.addIceCandidate(data.candidate); } catch(e){}
+    try { await pc.addIceCandidate(data.candidate); } catch(e){console.log(e);}
   }
 });
 
-socket.on('peer-left', () => {
-  appendMsg('Peer left');
-  // reset UI if needed
-});
-
-function initPeer(isCaller){
-  pc = new RTCPeerConnection(STUN_CONFIG);
+function init(isCaller){
+  const config = { iceServers:[{urls:'stun:stun.l.google.com:19302'}] };
+  pc = new RTCPeerConnection(config);
   pc.onicecandidate = e => {
-    if (e.candidate) {
-      socket.emit('signal', { room: roomId, type: 'candidate', candidate: e.candidate });
-    }
+    if (e.candidate) socket.emit('signal', { room, type:'candidate', candidate:e.candidate });
   };
   pc.ondatachannel = e => {
     dc = e.channel;
-    setupDataChannel();
+    setupDC();
   };
-  if (isCaller) {
+  if(isCaller){
     dc = pc.createDataChannel('file');
-    setupDataChannel();
+    setupDC();
   }
-  // show connected UI once DC opens
 }
 
-function createAndSendOffer(){
-  pc.createOffer().then(o=>{
-    pc.setLocalDescription(o);
-    socket.emit('signal', { room: roomId, type: 'offer', sdp: pc.localDescription });
-  });
-}
-
-function setupDataChannel(){
+function setupDC(){
   dc.binaryType = 'arraybuffer';
   dc.onopen = () => {
-    document.getElementById('transfer').style.display = 'block';
-    appendMsg('DataChannel open — you can send files now');
+    document.getElementById('fileInput').style.display = 'block';
   };
   dc.onmessage = handleIncoming;
 }
 
-// Incoming file handling
-let incoming = null;
+function makeOffer(){
+  pc.createOffer().then(o=>{
+    pc.setLocalDescription(o);
+    socket.emit('signal', { room, type:'offer', sdp:o });
+  });
+}
+
+const inc = { buffers:[], name:'', size:0, received:0 };
 function handleIncoming(e){
-  if (typeof e.data === 'string') {
+  if (typeof e.data === 'string'){
     const meta = JSON.parse(e.data);
-    incoming = { name: meta.name, size: meta.size, received: 0, buffers: [] };
-    updateProgress(0, incoming.size);
-    appendMsg('Receiving: ' + incoming.name);
+    inc.name = meta.name; inc.size = meta.size; inc.buffers=[];
+    document.getElementById('progress').textContent = `Receiving: ${meta.name}`;
     return;
   }
-  incoming.buffers.push(e.data);
-  incoming.received += e.data.byteLength;
-  updateProgress(incoming.received, incoming.size);
-  if (incoming.received === incoming.size) {
-    const blob = new Blob(incoming.buffers);
-    const url = URL.createObjectURL(blob);
+  inc.buffers.push(e.data);
+  inc.received += e.data.byteLength;
+  if (inc.received === inc.size){
+    const blob = new Blob(inc.buffers);
     const a = document.createElement('a');
-    a.href = url; a.download = incoming.name;
-    a.className = 'download';
-    a.textContent = 'Download ' + incoming.name;
-    document.getElementById('files').appendChild(a);
-    appendMsg('File received: ' + incoming.name);
-    incoming = null;
+    a.href = URL.createObjectURL(blob);
+    a.download = inc.name;
+    a.textContent = 'Download ' + inc.name;
+    document.body.appendChild(a);
   }
 }
 
-function appendMsg(t){
-  const d = document.createElement('div'); d.textContent = t;
-  document.getElementById('messages').appendChild(d);
-}
-
-function updateProgress(done, total){
-  document.getElementById('progress').textContent = `Progress: ${Math.round(done/total*100)}% (${done}/${total})`;
-}
-
-// file sending
-document.getElementById('fileInput').addEventListener('change', async (ev) => {
-  const files = ev.target.files;
-  for (const f of files){
-    await sendFile(f);
-  }
-});
-
-async function sendFile(file){
-  if (!dc || dc.readyState !== 'open') return alert('DataChannel not open yet');
-  appendMsg('Sending: ' + file.name);
-  dc.send(JSON.stringify({ name: file.name, size: file.size }));
-  const chunkSize = 64 * 1024; // 64KB
-  const buffer = await file.arrayBuffer();
-  for (let i=0; i < buffer.byteLength; i += chunkSize) {
-    dc.send(buffer.slice(i, i + chunkSize));
-    // simple backpressure control
-    if (dc.bufferedAmount > 1e6) {
-      await new Promise(r => setTimeout(r, 50));
+document.getElementById('fileInput').onchange = async (e) => {
+  for (const f of e.target.files){
+    dc.send(JSON.stringify({ name: f.name, size: f.size }));
+    const buf = await f.arrayBuffer();
+    const chunkSize = 64 * 1024;
+    for (let i=0; i<buf.byteLength; i+=chunkSize){
+      dc.send(buf.slice(i, i+chunkSize));
     }
+    document.getElementById('progress').textContent = `Sent: ${f.name}`;
   }
-  appendMsg('Sent: ' + file.name);
-}
-
-// Auto-join if ?room= present in URL (makes laptop side easier)
-const preRoom = new URLSearchParams(location.search).get('room');
-if (preRoom) {
-  document.getElementById('roomInput').value = preRoom;
-  // optionally auto-join (comment if you want manual press)
-  // document.getElementById('joinBtn').click();
-}
+};
 </script>
 </body>
 </html>
